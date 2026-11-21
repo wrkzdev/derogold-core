@@ -50,6 +50,12 @@ namespace CryptoNote
            peer is dropped as a sync source. */
         uint32_t m_sync_failures = 0;
 
+        /* Set when this peer answered a block request with "I do not have
+           those": it is pruned, or a lite node, and cannot serve the history we
+           are after. The node server reads it when the connection closes, to
+           stop dialling the same peer again straight away. */
+        bool m_pruned_peer = false;
+
         enum state
         {
             state_before_handshake = 0, // default state

@@ -384,6 +384,19 @@ namespace CryptoNote
        long enough that a dead one stops eating connection attempts. */
     const uint32_t P2P_FAILED_PEER_FORGET_SECONDS = 30 * 60;
 
+    /* How long a peer that could not serve the blocks we asked for (it is
+       pruned) is left alone after we drop it. Without this the connection
+       maker, with only a few peers to pick from, dialled the same one every
+       couple of seconds. Much shorter than the failed-peer time on purpose: the
+       peer is alive and still relays new blocks, so on a small network it must
+       come back into play soon. An operator can override it with `peer
+       connect` or `peer retry`. */
+    const uint32_t P2P_PRUNED_PEER_COOLDOWN_SECONDS = 5 * 60;
+
+    /* The longest a console ban lasts, so a typo in the seconds cannot overflow
+       the expiry time. */
+    const uint32_t P2P_MAX_BAN_SECONDS = 10 * 365 * 24 * 60 * 60;
+
     /* How often one gray peer is probed to find out whether it is still
        there. Gray entries are hearsay from other nodes and are otherwise
        never checked, so dead addresses circulate the network forever. */

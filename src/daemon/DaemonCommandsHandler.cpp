@@ -19,7 +19,9 @@
 #include <daemon/DaemonCommandsHandler.h>
 #include <filesystem>
 #include <p2p/NetNode.h>
+#include <p2p/PeerAddress.h>
 #include <rpc/JsonRpc.h>
+#include <system/Ipv4Resolver.h>
 #include <serialization/SerializationTools.h>
 #include <utilities/ColouredMsg.h>
 #include <utilities/FormatTools.h>
@@ -58,6 +60,57 @@ namespace
         std::ostringstream out;
         out << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
         return out.str();
+    }
+
+    /* Turns what was typed after a peer command into an address. A bare host,
+       without a port, is accepted only where portOptional says so.
+
+       A hostname is looked up here, on the console's own thread: the lookup
+       blocks, and the node's event loop is not the place for that. */
+    bool parseEndpoint(const std::string &text, bool portOptional, uint32_t &ip, uint32_t &port, std::string &error)
+    {
+        std::string host;
+        port = 0;
+
+        if (text.find(':') == std::string::npos)
+        {
+            if (!portOptional)
+            {
+                error = "expected <host>:<port>";
+                return false;
+            }
+
+            host = text;
+        }
+        else if (!CryptoNote::splitHostAndPort(text, host, port))
+        {
+            error = "expected <host>:<port> with a port from 1 to 65535";
+            return false;
+        }
+
+        if (CryptoNote::parseIpv4Literal(host, ip))
+        {
+            return true;
+        }
+
+        try
+        {
+            const auto addresses = System::Ipv4Resolver::resolveAll(host);
+
+            if (addresses.empty())
+            {
+                error = host + " has no IPv4 address";
+                return false;
+            }
+
+            ip = hostToNetwork(addresses.front().getValue());
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            error = "could not look up " + host + ": " + e.what();
+            return false;
+        }
     }
 
     template<typename T> bool print_as_json(std::ostream &output, const T &obj)
@@ -119,6 +172,12 @@ DaemonCommandsHandler::DaemonCommandsHandler(
         "ban",
         [this](const std::vector<std::string> &args) { return ban(args); },
         "Manage in-memory host bans: ban list | ban add <ip> [seconds] | ban delete <ip>"
+    );
+    m_consoleHandler.setHandler(
+        "peer",
+        [this](const std::vector<std::string> &args) { return peer(args); },
+        "Manage peers: peer list [all] | connect <host:port> [keep] | add <host:port> | disconnect <host[:port]> | "
+        "remove <host:port> | seeds | harvest <host:port> | retry"
     );
     m_consoleHandler.setHandler(
         "compact_db",
@@ -314,14 +373,16 @@ bool DaemonCommandsHandler::help(const std::vector<std::string> &args)
 //--------------------------------------------------------------------------------
 bool DaemonCommandsHandler::print_pl(const std::vector<std::string> &args)
 {
-    m_srv.log_peerlist();
+    /* Printed here, not logged: a console attached over the socket only sees
+       what a command writes to out(), so the log version showed it nothing. */
+    out() << m_srv.peerListReport(true);
     return true;
 }
 
 //--------------------------------------------------------------------------------
 bool DaemonCommandsHandler::print_cn(const std::vector<std::string> &args)
 {
-    m_srv.get_payload_object().log_connections();
+    out() << m_srv.connectionsReport();
     return true;
 }
 
@@ -632,35 +693,11 @@ bool DaemonCommandsHandler::status(const std::vector<std::string> &args)
 
 bool DaemonCommandsHandler::ban(const std::vector<std::string> &args)
 {
-    const auto now = std::chrono::system_clock::now();
-
-    for (auto it = m_bannedHosts.begin(); it != m_bannedHosts.end();)
-    {
-        if (it->second <= now)
-        {
-            it = m_bannedHosts.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
-    }
-
+    /* The list lives in the node server, which is what refuses the hosts on it:
+       a list kept here would only ever have been a list. */
     if (args.empty() || args[0] == "list")
     {
-        if (m_bannedHosts.empty())
-        {
-            out() << InformationMsg("Ban list is empty.") << std::endl;
-            return true;
-        }
-
-        out() << InformationMsg("Banned hosts:") << std::endl;
-        for (const auto &[ip, expiry] : m_bannedHosts)
-        {
-            const auto secs =
-                std::chrono::duration_cast<std::chrono::seconds>(expiry - now).count();
-            out() << "  " << ip << " (" << std::max<int64_t>(0, secs) << "s remaining)" << std::endl;
-        }
+        out() << m_srv.banReport();
         return true;
     }
 
@@ -672,18 +709,23 @@ bool DaemonCommandsHandler::ban(const std::vector<std::string> &args)
             return true;
         }
 
-        uint64_t banSeconds = 3600;
-        if (args.size() == 3 && !Common::fromString(args[2], banSeconds))
+        uint32_t ip = 0;
+
+        if (!CryptoNote::parseIpv4Literal(args[1], ip))
         {
-            out() << "Invalid seconds value." << std::endl;
+            out() << WarningMsg("Not an IPv4 address: ") << args[1] << std::endl;
             return true;
         }
 
-        m_bannedHosts[args[1]] = now + std::chrono::seconds(banSeconds);
-        out() << InformationMsg("Banned host: ") << SuccessMsg(args[1]) << InformationMsg(" for ")
-                  << SuccessMsg(std::to_string(banSeconds) + "s") << std::endl;
-        out() << InformationMsg("Note: active connection drop for bans is not exposed in this build.") << std::endl;
+        uint64_t banSeconds = 3600;
 
+        if (args.size() == 3 && (!Common::fromString(args[2], banSeconds) || banSeconds == 0))
+        {
+            out() << WarningMsg("Invalid seconds value.") << std::endl;
+            return true;
+        }
+
+        out() << m_srv.banHost(ip, banSeconds);
         return true;
     }
 
@@ -695,18 +737,169 @@ bool DaemonCommandsHandler::ban(const std::vector<std::string> &args)
             return true;
         }
 
-        if (m_bannedHosts.erase(args[1]) > 0)
+        uint32_t ip = 0;
+
+        if (!CryptoNote::parseIpv4Literal(args[1], ip))
         {
-            out() << InformationMsg("Unbanned host: ") << SuccessMsg(args[1]) << std::endl;
+            out() << WarningMsg("Not an IPv4 address: ") << args[1] << std::endl;
+            return true;
         }
-        else
-        {
-            out() << WarningMsg("Host is not in ban list: ") << args[1] << std::endl;
-        }
+
+        out() << m_srv.unbanHost(ip);
         return true;
     }
 
     out() << "usage: ban list | ban add <ip> [seconds] | ban delete <ip>" << std::endl;
+    return true;
+}
+
+bool DaemonCommandsHandler::peer(const std::vector<std::string> &args)
+{
+    const char *usage =
+        "usage:\n"
+        "  peer list [all]                  peer counts, cool-downs, the white list (and the gray list)\n"
+        "  peer connect <host:port> [keep]  dial a peer now to sync from; keep redials it if it drops\n"
+        "  peer add <host:port>             put a peer on the gray list without dialling it\n"
+        "  peer disconnect <host[:port]>    close the connections to a host\n"
+        "  peer remove <host:port>          forget a peer\n"
+        "  peer seeds                       ask the seed nodes for a fresh peer list now\n"
+        "  peer harvest <host:port>         take the peer list from one peer, then disconnect\n"
+        "  peer retry                       stop passing over peers that recently failed\n"
+        "see also: print_cn, print_pl, ban\n";
+
+    if (args.empty())
+    {
+        out() << usage;
+        return true;
+    }
+
+    std::string action = args[0];
+    std::transform(action.begin(), action.end(), action.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    /* Reads the address argument, or says what is wrong with it. */
+    const auto readAddress = [&](size_t index, bool portOptional, uint32_t &ip, uint32_t &port) {
+        if (args.size() <= index)
+        {
+            out() << usage;
+            return false;
+        }
+
+        std::string error;
+
+        if (!parseEndpoint(args[index], portOptional, ip, port, error))
+        {
+            out() << WarningMsg(error) << std::endl;
+            return false;
+        }
+
+        return true;
+    };
+
+    const auto tooManyArguments = [&](size_t most) {
+        if (args.size() > most)
+        {
+            out() << usage;
+            return true;
+        }
+
+        return false;
+    };
+
+    uint32_t ip = 0;
+    uint32_t port = 0;
+
+    if (action == "list")
+    {
+        const bool all = args.size() == 2 && args[1] == "all";
+
+        if (args.size() > 2 || (args.size() == 2 && !all))
+        {
+            out() << usage;
+            return true;
+        }
+
+        out() << m_srv.peerListReport(all);
+    }
+    else if (action == "connect")
+    {
+        const bool keep = args.size() == 3 && args[2] == "keep";
+
+        if (args.size() > 3 || (args.size() == 3 && !keep))
+        {
+            out() << usage;
+            return true;
+        }
+
+        if (!readAddress(1, false, ip, port))
+        {
+            return true;
+        }
+
+        out() << "Dialling " << Common::ipAddressToString(ip) << ":" << port << " ..." << std::endl;
+        out() << m_srv.connectToPeer(NetworkAddress {ip, port}, keep);
+    }
+    else if (action == "add")
+    {
+        if (tooManyArguments(2) || !readAddress(1, false, ip, port))
+        {
+            return true;
+        }
+
+        out() << m_srv.addPeer(NetworkAddress {ip, port});
+    }
+    else if (action == "disconnect")
+    {
+        if (tooManyArguments(2) || !readAddress(1, true, ip, port))
+        {
+            return true;
+        }
+
+        out() << m_srv.disconnectPeer(ip, port);
+    }
+    else if (action == "remove")
+    {
+        if (tooManyArguments(2) || !readAddress(1, false, ip, port))
+        {
+            return true;
+        }
+
+        out() << m_srv.forgetPeer(NetworkAddress {ip, port});
+    }
+    else if (action == "seeds")
+    {
+        if (tooManyArguments(1))
+        {
+            return true;
+        }
+
+        out() << "Asking the seed nodes ..." << std::endl;
+        out() << m_srv.reseed();
+    }
+    else if (action == "harvest")
+    {
+        if (tooManyArguments(2) || !readAddress(1, false, ip, port))
+        {
+            return true;
+        }
+
+        out() << m_srv.harvestPeers(NetworkAddress {ip, port});
+    }
+    else if (action == "retry")
+    {
+        if (tooManyArguments(1))
+        {
+            return true;
+        }
+
+        out() << m_srv.clearFailedPeers();
+    }
+    else
+    {
+        out() << usage;
+    }
+
     return true;
 }
 

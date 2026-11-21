@@ -83,7 +83,6 @@ private:
     std::shared_ptr<CryptoNote::IDataBase> m_database;
     std::shared_ptr<std::atomic<bool>> m_pruneTrigger;
 
-    std::unordered_map<std::string, std::chrono::system_clock::time_point> m_bannedHosts;
     std::future<void> m_compactDbTask;
     std::atomic<bool> m_compactDbRunning {false};
     std::atomic<bool> m_compactDbLastSuccess {true};
@@ -129,6 +128,8 @@ private:
     bool status(const std::vector<std::string> &args);
 
     bool ban(const std::vector<std::string> &args);
+
+    bool peer(const std::vector<std::string> &args);
 
     bool compact_db(const std::vector<std::string> &args);
 

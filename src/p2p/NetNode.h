@@ -19,7 +19,10 @@
 
 #include <Uuid.h>
 #include <atomic>
+#include <chrono>
+#include <config/CryptoNoteConfig.h>
 #include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -201,7 +204,76 @@ namespace CryptoNote
             return m_peerlist;
         }
 
+        /* Operator commands, for the daemon console. Every one of them is safe
+           to call from any thread: the work is handed to the dispatcher thread
+           that owns the connection and peer lists, and the caller waits for the
+           answer, which is text meant to be shown as it is. A call gives up
+           waiting after a while rather than hang a console on a node that is
+           stopping; the work it asked for may still finish afterwards.
+
+           Addresses are NetworkAddress values: the first octet in the low byte
+           of ip, as everywhere else in the node. Hostnames must already have
+           been resolved, because a lookup blocks and this thread is not the
+           place for that. */
+
+        /* Peer counts, bans, cool-downs, the white list and, when asked for, the
+           gray list. */
+        std::string peerListReport(bool includeGray);
+
+        /* The connection table that print_cn shows. */
+        std::string connectionsReport();
+
+        /* Dials the peer now, as a full connection that can be synced from, past
+           the out-peers target and any cool-down it is under. With keep the node
+           also redials it whenever the connection drops, until the next
+           restart. */
+        std::string connectToPeer(const NetworkAddress &address, bool keep);
+
+        /* Puts an address on the gray list without dialling it. */
+        std::string addPeer(const NetworkAddress &address);
+
+        /* Closes connections to the host. A port of 0 matches every port, which
+           is what an incoming connection needs because its port is not one the
+           peer listens on. Also ends any keep for it. */
+        std::string disconnectPeer(uint32_t ip, uint32_t port);
+
+        /* Takes the address off both lists, out of the priority list and out of
+           the cool-down map. Does not close a connection that is open. */
+        std::string forgetPeer(const NetworkAddress &address);
+
+        /* Asks the seed nodes for a fresh peer list right now instead of waiting
+           out the retry interval, and looks the seed hostnames up again. */
+        std::string reseed();
+
+        /* Handshakes with one peer, merges the peer list it sends and closes
+           the connection. */
+        std::string harvestPeers(const NetworkAddress &address);
+
+        /* Forgets every address the node is currently passing over. */
+        std::string clearFailedPeers();
+
+        std::string banReport();
+
+        std::string banHost(uint32_t ip, uint64_t seconds);
+
+        std::string unbanHost(uint32_t ip);
+
       private:
+        /* Runs job on the dispatcher thread and returns what it returns. */
+        std::string runOnDispatcher(std::function<std::string()> job, std::chrono::seconds timeout);
+
+        bool is_banned(uint32_t ip);
+
+        /* Why a console command may not dial this host, or an empty string if
+           it may. */
+        std::string reason_to_refuse(uint32_t ip);
+
+        /* Closes every connection to the host; port 0 means any port. Returns
+           how many it was asked to close. */
+        size_t close_connections_to(uint32_t ip, uint32_t port);
+
+        void remove_priority_peer(uint32_t ip, uint32_t port);
+
         int handleCommand(
             const LevinProtocol::Command &cmd,
             BinaryArray &buff_out,
@@ -326,7 +398,10 @@ namespace CryptoNote
            consume every connection attempt round after round. */
         bool is_addr_recently_failed(const NetworkAddress &addr);
 
-        void mark_addr_failed(const NetworkAddress &addr);
+        /* seconds is how long the address is passed over; the default is the
+           time an address that would not connect is given. A shorter mark never
+           shortens one that is already longer. */
+        void mark_addr_failed(const NetworkAddress &addr, uint32_t seconds = CryptoNote::P2P_FAILED_PEER_FORGET_SECONDS);
 
         bool gray_peerlist_housekeeping();
 
@@ -482,10 +557,15 @@ namespace CryptoNote
 
         std::list<PeerlistEntry> m_command_line_peers;
 
-        /* Address -> when it last refused us. Entries expire on lookup, and the
-           map is swept when it outgrows the gray list so address churn cannot
-           make it grow without bound. */
+        /* Address -> the time until which it is passed over. Entries expire on
+           lookup, and the map is swept when it outgrows the gray list so address
+           churn cannot make it grow without bound. */
         std::map<NetworkAddress, time_t> m_recentlyFailedPeers;
+
+        /* Host -> the time its ban ends, set from the console. Held in memory
+           only, so a restart lifts every ban. Keyed by IP alone: a banned host
+           is refused on every port. */
+        std::map<uint32_t, time_t> m_bannedHosts;
 
         uint64_t m_peer_livetime;
 

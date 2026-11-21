@@ -346,6 +346,33 @@ could type at the daemon's own console. A world-writable `--rpc-ipc-mode` is
 accepted but warned about loudly at startup, because the mode is the only thing
 guarding it.
 
+### Managing peers from the console
+
+A node that can only reach a few peers - or only pruned ones - can be pointed at
+a known good one without a restart. These work at the daemon's own console and
+over `--attach` alike:
+
+| Command | What it does |
+|---|---|
+| `peer connect <host:port> [keep]` | Dial the peer now, past the out-peers target and any cool-down, and sync from it if it is ahead. `keep` redials it whenever it drops, until the next restart. |
+| `peer add <host:port>` | Put a peer on the gray list without dialling it. |
+| `peer disconnect <host[:port]>` | Close the connections to a host (no port closes all of them, which is what an incoming peer needs). |
+| `peer remove <host:port>` | Forget a peer: both lists, the keep list and its cool-down. |
+| `peer seeds` | Ask the seed nodes for a fresh peer list now instead of waiting out the 5-minute retry, and look the seed hostnames up again. |
+| `peer harvest <host:port>` | Handshake with one peer, take the peer list it sends and disconnect: re-checking the network from a peer you trust. |
+| `peer retry` | Stop passing over addresses the node recently gave up on. |
+| `peer list [all]` | Peer counts, cool-downs, kept and banned peers, and the white list (`all` adds the gray list). |
+| `print_cn`, `print_pl` | The connection table and the full peer list. Both used to write to the daemon log only, so an attached console saw nothing. |
+| `ban add <ip> [seconds]`, `ban delete <ip>`, `ban list` | Bans a host on every port, closes its open connections and refuses it from then on. Bans live in memory and end at a restart. |
+
+A host name works wherever `host:port` is taken; it is looked up when the command
+runs. Loopback addresses are never accepted, and private ones need
+`--allow-local-ip`.
+
+A peer that answers a block request with "I do not have those" - a pruned node -
+is dropped, and is no longer redialled for 5 minutes, so a short peer list is not
+spent on one that cannot help. `peer connect` and `peer retry` override that.
+
 <p align="right">(<a href="#top">back to top</a>)</p>
 
 ## Fast Sync (--sync-from-height)

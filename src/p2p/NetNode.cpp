@@ -988,6 +988,12 @@ namespace CryptoNote
         uint64_t last_seen_stamp,
         bool white)
     {
+        if (is_banned(na.ip))
+        {
+            logger(DEBUGGING) << "Not connecting to " << na << ": the host is banned";
+            return false;
+        }
+
         logger(DEBUGGING) << "Connecting to " << na << " (white=" << white << ", last_seen: "
                           << (last_seen_stamp ? Common::timeIntervalToString(time(NULL) - last_seen_stamp) : "never")
                           << ")...";
@@ -1152,7 +1158,7 @@ namespace CryptoNote
             /* Passing over an address that just refused us costs nothing, so it
                does not count as one of the tries. Otherwise a few dead peers at
                the top of the list use up every attempt, every round. */
-            if (is_addr_recently_failed(pe.adr))
+            if (is_addr_recently_failed(pe.adr) || is_banned(pe.adr.ip))
             {
                 continue;
             }
@@ -1389,7 +1395,7 @@ namespace CryptoNote
             return false;
         }
 
-        if (time(nullptr) - it->second >= static_cast<time_t>(CryptoNote::P2P_FAILED_PEER_FORGET_SECONDS))
+        if (time(nullptr) >= it->second)
         {
             m_recentlyFailedPeers.erase(it);
             return false;
@@ -1398,10 +1404,14 @@ namespace CryptoNote
         return true;
     }
 
-    void NodeServer::mark_addr_failed(const NetworkAddress &addr)
+    void NodeServer::mark_addr_failed(const NetworkAddress &addr, uint32_t seconds)
     {
         const time_t now = time(nullptr);
-        m_recentlyFailedPeers[addr] = now;
+
+        /* The later of the two, so a short mark (a pruned peer) cannot cut
+           short a long one (a peer that would not connect). */
+        time_t &until = m_recentlyFailedPeers[addr];
+        until = std::max<time_t>(until, now + static_cast<time_t>(seconds));
 
         /* Entries expire lazily on lookup, so sweep once the map outgrows the
            gray list to keep address churn from growing it without bound. */
@@ -1409,11 +1419,28 @@ namespace CryptoNote
         {
             for (auto it = m_recentlyFailedPeers.begin(); it != m_recentlyFailedPeers.end();)
             {
-                it = now - it->second >= static_cast<time_t>(CryptoNote::P2P_FAILED_PEER_FORGET_SECONDS)
-                    ? m_recentlyFailedPeers.erase(it)
-                    : std::next(it);
+                it = now >= it->second ? m_recentlyFailedPeers.erase(it) : std::next(it);
             }
         }
+    }
+
+    //-----------------------------------------------------------------------------------
+    bool NodeServer::is_banned(uint32_t ip)
+    {
+        const auto it = m_bannedHosts.find(ip);
+
+        if (it == m_bannedHosts.end())
+        {
+            return false;
+        }
+
+        if (time(nullptr) >= it->second)
+        {
+            m_bannedHosts.erase(it);
+            return false;
+        }
+
+        return true;
     }
 
     //-----------------------------------------------------------------------------------
@@ -1865,6 +1892,581 @@ namespace CryptoNote
     }
     //-----------------------------------------------------------------------------------
 
+    //-----------------------------------------------------------------------------------
+    // Operator commands
+    //-----------------------------------------------------------------------------------
+
+    namespace
+    {
+        /* One handshake is up to connection_timeout * 4 (5 s to connect, 15 s to
+           handshake), so a single dial fits comfortably. */
+        constexpr std::chrono::seconds PEER_COMMAND_TIMEOUT(40);
+
+        /* A seed round dials one seed after another until one answers. */
+        constexpr std::chrono::seconds RESEED_TIMEOUT(240);
+
+        bool listContains(const std::list<PeerlistEntry> &list, const NetworkAddress &address)
+        {
+            return std::any_of(list.begin(), list.end(), [&address](const PeerlistEntry &entry) {
+                return entry.adr == address;
+            });
+        }
+    } // namespace
+
+    std::string NodeServer::runOnDispatcher(std::function<std::string()> job, std::chrono::seconds timeout)
+    {
+        if (m_stop)
+        {
+            return "The node is shutting down.\n";
+        }
+
+        /* Shared, so the job can still deliver its answer into a promise that
+           is alive after this call gave up and returned. */
+        auto promise = std::make_shared<std::promise<std::string>>();
+        auto future = promise->get_future();
+
+        try
+        {
+            m_dispatcher.remoteSpawn([job = std::move(job), promise] {
+                try
+                {
+                    promise->set_value(job());
+                }
+                catch (const System::InterruptedException &)
+                {
+                    promise->set_value("The node is shutting down.\n");
+                }
+                catch (const std::exception &e)
+                {
+                    promise->set_value(std::string("Failed: ") + e.what() + "\n");
+                }
+            });
+        }
+        catch (const std::exception &e)
+        {
+            return std::string("Could not reach the node: ") + e.what() + "\n";
+        }
+
+        if (future.wait_for(timeout) != std::future_status::ready)
+        {
+            return "The node did not answer within " + std::to_string(timeout.count())
+                   + " seconds. The command may still complete; check the log.\n";
+        }
+
+        return future.get();
+    }
+
+    std::string NodeServer::reason_to_refuse(uint32_t ip)
+    {
+        if (!m_peerlist.is_ip_allowed(ip))
+        {
+            return "loopback addresses are never allowed, and private ones need --allow-local-ip";
+        }
+
+        if (is_banned(ip))
+        {
+            return "the host is banned; `ban delete " + Common::ipAddressToString(ip) + "` lifts it";
+        }
+
+        return "";
+    }
+
+    size_t NodeServer::close_connections_to(uint32_t ip, uint32_t port)
+    {
+        size_t closed = 0;
+
+        forEachConnection([&](P2pConnectionContext &ctx) {
+            if (ctx.m_remote_ip != ip || (port != 0 && ctx.m_remote_port != port))
+            {
+                return;
+            }
+
+            ++closed;
+
+            /* A connection whose handler has not started yet has no context to
+               interrupt. Mark it, and the handler closes it on its first read. */
+            if (ctx.context != nullptr)
+            {
+                safeInterrupt(ctx);
+            }
+            else
+            {
+                ctx.m_state = CryptoNoteConnectionContext::state_shutdown;
+            }
+        });
+
+        return closed;
+    }
+
+    void NodeServer::remove_priority_peer(uint32_t ip, uint32_t port)
+    {
+        m_priority_peers.erase(
+            std::remove_if(
+                m_priority_peers.begin(),
+                m_priority_peers.end(),
+                [ip, port](const NetworkAddress &peer) { return peer.ip == ip && (port == 0 || peer.port == port); }),
+            m_priority_peers.end());
+    }
+
+    //-----------------------------------------------------------------------------------
+
+    std::string NodeServer::peerListReport(bool includeGray)
+    {
+        return runOnDispatcher(
+            [this, includeGray]() -> std::string {
+                std::ostringstream out;
+                const time_t now = time(nullptr);
+
+                std::list<PeerlistEntry> white;
+                std::list<PeerlistEntry> gray;
+                m_peerlist.get_peerlist_full(gray, white);
+
+                out << "Known peers: " << white.size() << " white, " << gray.size() << " gray\n"
+                    << "Connections: " << get_outgoing_connections_count() << " outgoing (aiming for "
+                    << m_targetOutgoingConnections << "), " << get_incoming_connections_count()
+                    << " incoming (limit " << m_maxIncomingConnections << ")\n";
+
+                if (!m_exclusive_peers.empty())
+                {
+                    out << "Exclusive peers (the only ones dialled):\n";
+                    for (const auto &peer : m_exclusive_peers)
+                    {
+                        out << "  " << peer << "\n";
+                    }
+                }
+
+                if (!m_priority_peers.empty())
+                {
+                    out << "Peers kept connected:\n";
+                    for (const auto &peer : m_priority_peers)
+                    {
+                        out << "  " << peer << (is_addr_connected(peer) ? " (connected)" : " (not connected)") << "\n";
+                    }
+                }
+
+                size_t cooling = 0;
+                for (const auto &entry : m_recentlyFailedPeers)
+                {
+                    if (entry.second > now)
+                    {
+                        ++cooling;
+                    }
+                }
+
+                if (cooling != 0)
+                {
+                    constexpr size_t SHOWN = 20;
+                    size_t shown = 0;
+
+                    out << "Passed over for now (" << cooling << "; `peer retry` clears this):\n";
+                    for (const auto &entry : m_recentlyFailedPeers)
+                    {
+                        if (entry.second <= now)
+                        {
+                            continue;
+                        }
+
+                        if (++shown > SHOWN)
+                        {
+                            out << "  ... and " << cooling - SHOWN << " more\n";
+                            break;
+                        }
+
+                        out << "  " << entry.first << " (" << entry.second - now << "s left)\n";
+                    }
+                }
+
+                for (auto it = m_bannedHosts.begin(); it != m_bannedHosts.end();)
+                {
+                    it = it->second <= now ? m_bannedHosts.erase(it) : std::next(it);
+                }
+
+                if (!m_bannedHosts.empty())
+                {
+                    out << "Banned hosts: " << m_bannedHosts.size() << " (`ban list` shows them)\n";
+                }
+
+                out << "\nWhite peerlist:\n" << print_peerlist_to_string(white);
+
+                if (includeGray)
+                {
+                    out << "\nGray peerlist:\n" << print_peerlist_to_string(gray);
+                }
+                else if (!gray.empty())
+                {
+                    out << "\n" << gray.size() << " gray peers not shown; `peer list all` shows them.\n";
+                }
+
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::connectionsReport()
+    {
+        return runOnDispatcher([this] { return m_payload_handler.connectionsTable() + "\n"; }, PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::connectToPeer(const NetworkAddress &address, bool keep)
+    {
+        return runOnDispatcher(
+            [this, address, keep]() -> std::string {
+                std::ostringstream out;
+
+                const std::string refusal = reason_to_refuse(address.ip);
+
+                if (!refusal.empty())
+                {
+                    out << "Refused " << address << ": " << refusal << "\n";
+                    return out.str();
+                }
+
+                if (is_addr_connected(address))
+                {
+                    out << "Already connected to " << address << ".\n";
+                }
+                else
+                {
+                    /* The point of asking is to dial it, whatever the node
+                       learned about it before. */
+                    m_recentlyFailedPeers.erase(address);
+
+                    if (!try_to_connect_and_handshake_with_new_peer(address, false, 0, true))
+                    {
+                        out << "Could not connect to " << address
+                            << ": it did not answer, it is on another network, or it is this node. "
+                               "Raise the log level with set_log to see which.\n";
+                        return out.str();
+                    }
+
+                    out << "Connected to " << address;
+
+                    for (const auto &kv : m_connections)
+                    {
+                        const auto &conn = kv.second;
+
+                        if (!conn.m_is_income && conn.m_remote_ip == address.ip && conn.m_remote_port == address.port)
+                        {
+                            out << " (peer height " << conn.m_remote_blockchain_height << ")";
+                            break;
+                        }
+                    }
+
+                    out << ". Blocks are downloaded from it if it is ahead of this node.\n";
+                }
+
+                /* Only after a connection worked: a dead address kept here would
+                   be dialled every second for as long as the node runs. */
+                if (keep && std::find(m_priority_peers.begin(), m_priority_peers.end(), address) == m_priority_peers.end())
+                {
+                    m_priority_peers.push_back(address);
+                    out << "It is reconnected whenever the connection drops, until the node restarts.\n";
+                }
+
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::addPeer(const NetworkAddress &address)
+    {
+        return runOnDispatcher(
+            [this, address]() -> std::string {
+                std::ostringstream out;
+
+                const std::string refusal = reason_to_refuse(address.ip);
+
+                if (!refusal.empty())
+                {
+                    out << "Refused " << address << ": " << refusal << "\n";
+                    return out.str();
+                }
+
+                std::list<PeerlistEntry> white;
+                std::list<PeerlistEntry> gray;
+                m_peerlist.get_peerlist_full(gray, white);
+
+                m_recentlyFailedPeers.erase(address);
+
+                if (listContains(white, address))
+                {
+                    out << address << " is already on the white list.\n";
+                }
+                else if (listContains(gray, address))
+                {
+                    out << address << " is already on the gray list.\n";
+                }
+                else
+                {
+                    PeerlistEntry entry = PeerlistEntry {};
+                    entry.adr = address;
+                    entry.id = Random::randomValue<uint64_t>();
+                    entry.last_seen = static_cast<uint64_t>(time(nullptr));
+
+                    m_peerlist.append_with_peer_gray(entry);
+                    out << "Added " << address << " to the gray list. The node dials it when it needs peers; "
+                        << "`peer connect " << address << "` dials it now.\n";
+                }
+
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::disconnectPeer(uint32_t ip, uint32_t port)
+    {
+        return runOnDispatcher(
+            [this, ip, port]() -> std::string {
+                std::ostringstream out;
+                const std::string target = Common::ipAddressToString(ip) + (port != 0 ? ":" + std::to_string(port) : "");
+
+                const size_t closed = close_connections_to(ip, port);
+                remove_priority_peer(ip, port);
+
+                if (closed == 0)
+                {
+                    out << "No connection to " << target << ".\n";
+                }
+                else
+                {
+                    out << "Closing " << closed << " connection(s) to " << target << ". The peer stays on the lists; "
+                        << "`peer remove` forgets it and `ban add` keeps it away.\n";
+                }
+
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::forgetPeer(const NetworkAddress &address)
+    {
+        return runOnDispatcher(
+            [this, address]() -> std::string {
+                std::ostringstream out;
+
+                const bool white = m_peerlist.remove_from_white(address);
+                const bool gray = m_peerlist.remove_from_gray(address);
+                const bool cooling = m_recentlyFailedPeers.erase(address) > 0;
+
+                const size_t priorityBefore = m_priority_peers.size();
+                remove_priority_peer(address.ip, address.port);
+                const bool priority = m_priority_peers.size() != priorityBefore;
+
+                if (!white && !gray && !cooling && !priority)
+                {
+                    out << address << " is not on any list.\n";
+                    return out.str();
+                }
+
+                out << "Forgot " << address << " (";
+
+                const char *separator = "";
+                const auto note = [&](bool present, const char *what) {
+                    if (present)
+                    {
+                        out << separator << what;
+                        separator = ", ";
+                    }
+                };
+
+                note(white, "white list");
+                note(gray, "gray list");
+                note(priority, "kept-connected list");
+                note(cooling, "cool-down");
+
+                out << "). A connection that is open stays open; `peer disconnect` closes it.\n";
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::reseed()
+    {
+        return runOnDispatcher(
+            [this]() -> std::string {
+                std::ostringstream out;
+
+                if (!m_seed_resolve_in_flight)
+                {
+                    start_seed_resolve();
+                    out << "Looking the seed hostnames up again; any new addresses are used within a few seconds.\n";
+                }
+
+                /* A copy: a finished lookup swaps m_seed_nodes while this waits
+                   on a seed, and an index into the old vector would not survive
+                   that. */
+                const std::vector<NetworkAddress> seeds = m_seed_nodes;
+
+                if (seeds.empty())
+                {
+                    out << "No seed node address is known yet, so there is nothing to ask. "
+                           "Run `peer seeds` again in a moment.\n";
+                    return out.str();
+                }
+
+                const size_t whiteBefore = m_peerlist.get_white_peers_count();
+                const size_t grayBefore = m_peerlist.get_gray_peers_count();
+
+                const size_t start = Random::randomValue<size_t>() % seeds.size();
+                size_t tried = 0;
+                bool reached = false;
+                NetworkAddress used = NetworkAddress {};
+
+                for (size_t i = 0; i < seeds.size() && !m_stop; ++i)
+                {
+                    const NetworkAddress &seed = seeds[(start + i) % seeds.size()];
+                    ++tried;
+
+                    if (try_to_connect_and_handshake_with_new_peer(seed, true))
+                    {
+                        reached = true;
+                        used = seed;
+                        break;
+                    }
+                }
+
+                if (!reached)
+                {
+                    out << "None of the " << tried << " seed node address(es) answered.\n";
+                    return out.str();
+                }
+
+                const auto delta = [](size_t before, size_t after) {
+                    return std::to_string(before) + " -> " + std::to_string(after);
+                };
+
+                out << "Asked the seed node " << used << " for its peer list (" << tried << " tried). White "
+                    << delta(whiteBefore, m_peerlist.get_white_peers_count()) << ", gray "
+                    << delta(grayBefore, m_peerlist.get_gray_peers_count()) << ".\n";
+
+                return out.str();
+            },
+            RESEED_TIMEOUT);
+    }
+
+    std::string NodeServer::harvestPeers(const NetworkAddress &address)
+    {
+        return runOnDispatcher(
+            [this, address]() -> std::string {
+                std::ostringstream out;
+
+                const std::string refusal = reason_to_refuse(address.ip);
+
+                if (!refusal.empty())
+                {
+                    out << "Refused " << address << ": " << refusal << "\n";
+                    return out.str();
+                }
+
+                const size_t whiteBefore = m_peerlist.get_white_peers_count();
+                const size_t grayBefore = m_peerlist.get_gray_peers_count();
+
+                if (!try_to_connect_and_handshake_with_new_peer(address, true))
+                {
+                    out << address << " did not answer the handshake.\n";
+                    return out.str();
+                }
+
+                out << "Took the peer list from " << address << ". White " << whiteBefore << " -> "
+                    << m_peerlist.get_white_peers_count() << ", gray " << grayBefore << " -> "
+                    << m_peerlist.get_gray_peers_count() << ".\n";
+
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::clearFailedPeers()
+    {
+        return runOnDispatcher(
+            [this]() -> std::string {
+                const size_t cleared = m_recentlyFailedPeers.size();
+                m_recentlyFailedPeers.clear();
+
+                return "Cleared " + std::to_string(cleared) + " address(es) the node was passing over; "
+                       "it may dial any of them again now.\n";
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::banReport()
+    {
+        return runOnDispatcher(
+            [this]() -> std::string {
+                std::ostringstream out;
+                const time_t now = time(nullptr);
+
+                for (auto it = m_bannedHosts.begin(); it != m_bannedHosts.end();)
+                {
+                    it = it->second <= now ? m_bannedHosts.erase(it) : std::next(it);
+                }
+
+                if (m_bannedHosts.empty())
+                {
+                    return "Ban list is empty.\n";
+                }
+
+                out << "Banned hosts:\n";
+
+                for (const auto &entry : m_bannedHosts)
+                {
+                    out << "  " << Common::ipAddressToString(entry.first) << " (" << entry.second - now
+                        << "s remaining)\n";
+                }
+
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::banHost(uint32_t ip, uint64_t seconds)
+    {
+        return runOnDispatcher(
+            [this, ip, seconds]() -> std::string {
+                std::ostringstream out;
+
+                const uint64_t capped = std::min<uint64_t>(seconds, CryptoNote::P2P_MAX_BAN_SECONDS);
+                m_bannedHosts[ip] = time(nullptr) + static_cast<time_t>(capped);
+
+                const size_t closed = close_connections_to(ip, 0);
+                remove_priority_peer(ip, 0);
+
+                out << "Banned " << Common::ipAddressToString(ip) << " for " << capped << "s";
+
+                if (capped != seconds)
+                {
+                    out << " (the longest a ban can last)";
+                }
+
+                out << ". It is refused on every port until then, or until the node restarts.";
+
+                if (closed != 0)
+                {
+                    out << " Closing " << closed << " open connection(s) to it.";
+                }
+
+                out << "\n";
+                return out.str();
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    std::string NodeServer::unbanHost(uint32_t ip)
+    {
+        return runOnDispatcher(
+            [this, ip]() -> std::string {
+                if (m_bannedHosts.erase(ip) > 0)
+                {
+                    return "Unbanned " + Common::ipAddressToString(ip) + ".\n";
+                }
+
+                return Common::ipAddressToString(ip) + " is not in the ban list.\n";
+            },
+            PEER_COMMAND_TIMEOUT);
+    }
+
+    //-----------------------------------------------------------------------------------
+
     void NodeServer::on_connection_new(P2pConnectionContext &context)
     {
         logger(TRACE) << context << "NEW CONNECTION";
@@ -1916,6 +2518,15 @@ namespace CryptoNote
                 auto addressAndPort = ctx.connection.getPeerAddressAndPort();
                 ctx.m_remote_ip = hostToNetwork(addressAndPort.first.getValue());
                 ctx.m_remote_port = addressAndPort.second;
+
+                /* Let it fall out of scope, which closes it, exactly as the
+                   in-peers limit does. */
+                if (is_banned(ctx.m_remote_ip))
+                {
+                    logger(DEBUGGING) << "Refused an incoming connection from the banned host "
+                                      << Common::ipAddressToString(ctx.m_remote_ip);
+                    continue;
+                }
 
                 auto iter = m_connections.emplace(ctx.m_connection_id, std::move(ctx)).first;
                 const Common::Uuid &connectionId = iter->first;
@@ -2115,6 +2726,24 @@ namespace CryptoNote
             safeInterrupt(ctx);
             safeInterrupt(writeContext);
             writeContext.wait();
+
+            /* A peer that could not serve the blocks we asked for is alive but
+               no use for catching up. Leave it alone for a few minutes rather
+               than letting the connection maker pick it again within seconds,
+               which with a short peer list it otherwise does. Only for a peer
+               we dialled: an incoming connection's port is not one it listens
+               on, so there is no address worth remembering. */
+            if (ctx.m_pruned_peer && !ctx.m_is_income)
+            {
+                const NetworkAddress remote {ctx.m_remote_ip, ctx.m_remote_port};
+
+                mark_addr_failed(remote, CryptoNote::P2P_PRUNED_PEER_COOLDOWN_SECONDS);
+
+                logger(INFO) << "Not dialling " << remote << " again for "
+                             << CryptoNote::P2P_PRUNED_PEER_COOLDOWN_SECONDS / 60
+                             << " minutes: it cannot serve the blocks we need. `peer connect "
+                             << remote << "` dials it anyway.";
+            }
 
             on_connection_close(ctx);
             m_connections.erase(connectionId);

@@ -303,6 +303,11 @@ namespace CryptoNote
 
     void CryptoNoteProtocolHandler::log_connections()
     {
+        logger(INFO) << "Connections:" << ENDL << connectionsTable();
+    }
+
+    std::string CryptoNoteProtocolHandler::connectionsTable()
+    {
         auto stateToShort = [](CryptoNoteConnectionContext::state state) -> std::string {
             switch (state)
             {
@@ -352,7 +357,7 @@ namespace CryptoNote
                 << " | " << std::setw(16) << std::left << stateToShort(cntxt.m_state)
                 << " | " << std::setw(14) << std::left << formatUptime(cntxt.m_started)
                 << " | " << std::setw(8) << std::right << cntxt.m_remote_blockchain_height
-                << " | " << std::setw(6) << std::left << "no"
+                << " | " << std::setw(6) << std::left << (cntxt.m_pruned_peer ? "yes" : "no")
                 << " | " << std::setw(5) << std::right << cntxt.m_sync_batch_size
                 << " | " << std::setw(4) << std::right << cntxt.m_sync_failures
                 << " |";
@@ -373,7 +378,7 @@ namespace CryptoNote
         }
 
         ss << separator;
-        logger(INFO) << "Connections:" << ENDL << ss.str();
+        return ss.str();
     }
 
     uint32_t CryptoNoteProtocolHandler::get_current_blockchain_height()
@@ -857,6 +862,8 @@ namespace CryptoNote
 
             if (peerReportedMissing)
             {
+                context.m_pruned_peer = true;
+
                 logger(Logging::WARNING, Logging::BRIGHT_YELLOW)
                     << context << "cannot serve " << arg.missed_ids.size()
                     << " of the blocks we requested (it is most likely pruned), dropping connection";

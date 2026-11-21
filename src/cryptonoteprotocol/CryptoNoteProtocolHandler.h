@@ -56,6 +56,11 @@ namespace CryptoNote
 
         void log_connections();
 
+        /* The table log_connections prints, as text, for a caller that wants
+           it somewhere other than the log. Reads the connection list, so it
+           has to run on the node server's own thread. */
+        std::string connectionsTable();
+
         // Interface t_payload_net_handler, where t_payload_net_handler is template argument of nodetool::node_server
         void stop();
 
