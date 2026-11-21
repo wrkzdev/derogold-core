@@ -326,8 +326,13 @@ namespace CryptoNote
 
         void initUpnp();
 
-        bool
-            handshake(CryptoNote::LevinProtocol &proto, P2pConnectionContext &context, bool just_take_peerlist = false);
+        /* failure, when given, is set to why a handshake that returned false
+           failed, in words for an operator. */
+        bool handshake(
+            CryptoNote::LevinProtocol &proto,
+            P2pConnectionContext &context,
+            bool just_take_peerlist = false,
+            std::string *failure = nullptr);
 
         bool timedSync();
 
@@ -411,7 +416,8 @@ namespace CryptoNote
             const NetworkAddress &na,
             bool just_take_peerlist = false,
             uint64_t last_seen_stamp = 0,
-            bool white = true);
+            bool white = true,
+            std::string *failure = nullptr);
 
         bool is_peer_used(const PeerlistEntry &peer);
 

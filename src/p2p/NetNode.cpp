@@ -477,8 +477,15 @@ namespace CryptoNote
         auto exclusiveNodes = config.getExclusiveNodes();
         std::copy(exclusiveNodes.begin(), exclusiveNodes.end(), std::back_inserter(m_exclusive_peers));
 
-        auto priorityNodes = config.getPriorityNodes();
-        std::copy(priorityNodes.begin(), priorityNodes.end(), std::back_inserter(m_priority_peers));
+        /* Once each: the same --add-priority-node given on the command line and
+           in the config file used to be dialled twice on every pass. */
+        for (const auto &priorityNode : config.getPriorityNodes())
+        {
+            if (std::find(m_priority_peers.begin(), m_priority_peers.end(), priorityNode) == m_priority_peers.end())
+            {
+                m_priority_peers.push_back(priorityNode);
+            }
+        }
 
         /* Left unresolved on purpose: init() and every later lookup turn these
            into addresses, so a seed hostname is followed if it moves. */
@@ -812,8 +819,22 @@ namespace CryptoNote
     }
 
     //-----------------------------------------------------------------------------------
-    bool NodeServer::handshake(CryptoNote::LevinProtocol &proto, P2pConnectionContext &context, bool just_take_peerlist)
+    bool NodeServer::handshake(
+        CryptoNote::LevinProtocol &proto,
+        P2pConnectionContext &context,
+        bool just_take_peerlist,
+        std::string *failure)
     {
+        /* Says why the handshake failed, for a caller that wants to show it. */
+        const auto fail = [failure](const std::string &why) {
+            if (failure != nullptr)
+            {
+                *failure = why;
+            }
+
+            return false;
+        };
+
         COMMAND_HANDSHAKE::request arg;
         COMMAND_HANDSHAKE::response rsp;
         get_local_node_data(arg.node_data);
@@ -824,7 +845,9 @@ namespace CryptoNote
             logger(Logging::DEBUGGING)
                 << context
                 << "A daemon on the network has departed. MSG: Failed to invoke COMMAND_HANDSHAKE, closing connection.";
-            return false;
+            return fail(
+                "it closed the connection or sent no handshake reply (is it a node of this network, and does it have "
+                "a free in-peers slot?)");
         }
 
         context.version = rsp.node_data.version;
@@ -833,14 +856,14 @@ namespace CryptoNote
         {
             logger(Logging::DEBUGGING) << context << "COMMAND_HANDSHAKE Failed, wrong network! ("
                                        << rsp.node_data.network_id << "), closing connection.";
-            return false;
+            return fail("it is on a different network");
         }
 
         if (rsp.node_data.version < CryptoNote::P2P_MINIMUM_VERSION)
         {
             logger(Logging::DEBUGGING) << context << "COMMAND_HANDSHAKE Failed, peer is wrong version! ("
                                        << std::to_string(rsp.node_data.version) << "), closing connection.";
-            return false;
+            return fail("its P2P version (" + std::to_string(rsp.node_data.version) + ") is too old");
         }
         else if ((rsp.node_data.version - CryptoNote::P2P_CURRENT_VERSION) >= CryptoNote::P2P_UPGRADE_WINDOW)
         {
@@ -853,7 +876,9 @@ namespace CryptoNote
         {
             logger(Logging::ERROR) << context
                                    << "COMMAND_HANDSHAKE: failed to handle_remote_peerlist(...), closing connection.";
-            return false;
+            return fail(
+                "its peer list was rejected: it has entries dated after the peer's own clock, so one of the two "
+                "clocks is wrong");
         }
 
         if (just_take_peerlist)
@@ -866,7 +891,7 @@ namespace CryptoNote
             logger(Logging::ERROR)
                 << context
                 << "COMMAND_HANDSHAKE invoked, but process_payload_sync_data returned false, dropping connection.";
-            return false;
+            return fail("its chain data was rejected");
         }
 
         context.peerId = rsp.node_data.peer_id;
@@ -875,7 +900,9 @@ namespace CryptoNote
         if (rsp.node_data.peer_id == m_config.m_peer_id)
         {
             logger(Logging::TRACE) << context << "Connection to self detected, dropping connection";
-            return false;
+            return fail(
+                "it reports this node's own peer ID, so the node treats it as itself. Two daemons that share a data "
+                "directory or a copied p2pstate.bin share one ID; give each its own data directory");
         }
 
         logger(Logging::DEBUGGING) << context << "COMMAND_HANDSHAKE INVOKED OK";
@@ -986,12 +1013,22 @@ namespace CryptoNote
         const NetworkAddress &na,
         bool just_take_peerlist,
         uint64_t last_seen_stamp,
-        bool white)
+        bool white,
+        std::string *failure)
     {
+        const auto fail = [failure](const std::string &why) {
+            if (failure != nullptr)
+            {
+                *failure = why;
+            }
+
+            return false;
+        };
+
         if (is_banned(na.ip))
         {
             logger(DEBUGGING) << "Not connecting to " << na << ": the host is banned";
-            return false;
+            return fail("the host is banned");
         }
 
         logger(DEBUGGING) << "Connecting to " << na << " (white=" << white << ", last_seen: "
@@ -1022,7 +1059,9 @@ namespace CryptoNote
             catch (System::InterruptedException &)
             {
                 logger(DEBUGGING) << "Connection timed out";
-                return false;
+                return fail(
+                    "no TCP connection within " + std::to_string(m_config.m_net_config.connection_timeout / 1000)
+                    + " seconds (a firewall, or nothing listening there)");
             }
 
             P2pConnectionContext ctx(m_dispatcher, logger.getLogger(), std::move(connection));
@@ -1037,7 +1076,7 @@ namespace CryptoNote
             {
                 System::Context<bool> handshakeContext(m_dispatcher, [&] {
                     CryptoNote::LevinProtocol proto(ctx.connection);
-                    return handshake(proto, ctx, just_take_peerlist);
+                    return handshake(proto, ctx, just_take_peerlist, failure);
                 });
 
                 System::Context<> timeoutContext(m_dispatcher, [&] {
@@ -1051,13 +1090,19 @@ namespace CryptoNote
                 if (!handshakeContext.get())
                 {
                     logger(DEBUGGING) << "Failed to HANDSHAKE with peer " << na;
+
+                    if (failure != nullptr && failure->empty())
+                    {
+                        *failure = "the handshake failed";
+                    }
+
                     return false;
                 }
             }
             catch (System::InterruptedException &)
             {
                 logger(DEBUGGING) << "Handshake timed out";
-                return false;
+                return fail("it accepted the connection but did not finish the handshake in time");
             }
 
             if (just_take_peerlist)
@@ -1094,9 +1139,10 @@ namespace CryptoNote
         catch (const std::exception &e)
         {
             logger(DEBUGGING) << "Connection to " << na << " failed: " << e.what();
+            return fail(std::string("the connection failed: ") + e.what());
         }
 
-        return false;
+        return fail("the connection failed");
     }
 
     //-----------------------------------------------------------------------------------
@@ -2131,11 +2177,11 @@ namespace CryptoNote
                        learned about it before. */
                     m_recentlyFailedPeers.erase(address);
 
-                    if (!try_to_connect_and_handshake_with_new_peer(address, false, 0, true))
+                    std::string failure;
+
+                    if (!try_to_connect_and_handshake_with_new_peer(address, false, 0, true, &failure))
                     {
-                        out << "Could not connect to " << address
-                            << ": it did not answer, it is on another network, or it is this node. "
-                               "Raise the log level with set_log to see which.\n";
+                        out << "Could not connect to " << address << ": " << failure << ".\n";
                         return out.str();
                     }
 
@@ -2311,13 +2357,14 @@ namespace CryptoNote
                 size_t tried = 0;
                 bool reached = false;
                 NetworkAddress used = NetworkAddress {};
+                std::string failure;
 
                 for (size_t i = 0; i < seeds.size() && !m_stop; ++i)
                 {
                     const NetworkAddress &seed = seeds[(start + i) % seeds.size()];
                     ++tried;
 
-                    if (try_to_connect_and_handshake_with_new_peer(seed, true))
+                    if (try_to_connect_and_handshake_with_new_peer(seed, true, 0, true, &failure))
                     {
                         reached = true;
                         used = seed;
@@ -2327,7 +2374,8 @@ namespace CryptoNote
 
                 if (!reached)
                 {
-                    out << "None of the " << tried << " seed node address(es) answered.\n";
+                    out << "None of the " << tried << " seed node address(es) answered; the last one failed because "
+                        << failure << ".\n";
                     return out.str();
                 }
 
@@ -2361,9 +2409,11 @@ namespace CryptoNote
                 const size_t whiteBefore = m_peerlist.get_white_peers_count();
                 const size_t grayBefore = m_peerlist.get_gray_peers_count();
 
-                if (!try_to_connect_and_handshake_with_new_peer(address, true))
+                std::string failure;
+
+                if (!try_to_connect_and_handshake_with_new_peer(address, true, 0, true, &failure))
                 {
-                    out << address << " did not answer the handshake.\n";
+                    out << "Could not take the peer list from " << address << ": " << failure << ".\n";
                     return out.str();
                 }
 
