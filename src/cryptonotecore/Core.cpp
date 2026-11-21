@@ -2444,6 +2444,14 @@ namespace CryptoNote
 
         fee = result.fee;
 
+        /* The error code alone says "wrong number of signatures"; the validator's
+           own message says what it actually found, and was being thrown away. */
+        if (result.errorCode && !result.errorMessage.empty())
+        {
+            logger(Logging::DEBUGGING) << "Transaction " << cachedTransaction.getTransactionHash()
+                                       << " rejected: " << result.errorMessage;
+        }
+
         return result.errorCode;
     }
 

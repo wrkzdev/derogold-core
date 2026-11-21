@@ -16,6 +16,84 @@
 #include <utilities/Fees.h>
 #include <utilities/Utilities.h>
 
+#include <algorithm>
+#include <sstream>
+
+namespace
+{
+    /* The text for a ring whose member count does not match its signature count.
+
+       A transaction that really has the wrong number of signatures is rare. The
+       usual cause is ring members missing from this node's database: the lookup
+       skips what it cannot find and still reports success, so the count comes
+       back short and the transaction is blamed. Name the missing ones, so the
+       log says which output the node lacks instead of leaving it to be guessed.
+       This only runs once the transaction is already being rejected, so the
+       extra reads cost nothing that matters. */
+    std::string describeRingMismatch(
+        const CryptoNote::IBlockchainCache &cache,
+        const uint64_t amount,
+        const uint64_t blockHeight,
+        const std::vector<uint32_t> &globalIndexes,
+        const size_t keysFound,
+        const size_t signatureCount)
+    {
+        std::ostringstream out;
+
+        out << "Transaction has an invalid number of signatures: a ring of " << globalIndexes.size()
+            << " for amount " << amount << " has " << keysFound << " member(s) in this node's database and "
+            << signatureCount << " signature(s)";
+
+        if (keysFound >= globalIndexes.size())
+        {
+            return out.str();
+        }
+
+        try
+        {
+            std::vector<uint32_t> missing;
+
+            for (const uint32_t index : globalIndexes)
+            {
+                uint32_t single = index;
+                std::vector<Crypto::PublicKey> key;
+
+                cache.extractKeyOutputKeys(
+                    amount, static_cast<uint32_t>(blockHeight), Common::ArrayView<uint32_t>(&single, 1), key);
+
+                if (key.empty())
+                {
+                    missing.push_back(index);
+                }
+            }
+
+            constexpr size_t SHOWN = 10;
+
+            out << "; missing from the database, by global index:";
+
+            for (size_t i = 0; i < std::min(missing.size(), SHOWN); ++i)
+            {
+                out << " " << missing[i];
+            }
+
+            if (missing.size() > SHOWN)
+            {
+                out << " and " << missing.size() - SHOWN << " more";
+            }
+
+            out << "; the database holds "
+                << cache.getKeyOutputsCountForAmount(amount, static_cast<uint32_t>(blockHeight))
+                << " output(s) of that amount at this height";
+        }
+        catch (const std::exception &e)
+        {
+            out << "; could not tell which are missing: " << e.what();
+        }
+
+        return out.str();
+    }
+} // namespace
+
 ValidateTransaction::ValidateTransaction(
     const CryptoNote::CachedTransaction &cachedTransaction,
     CryptoNote::TransactionValidatorState &state,
@@ -694,7 +772,14 @@ bool ValidateTransaction::validateTransactionInputsExpensive()
                 {
                     setTransactionValidationResult(
                         CryptoNote::error::TransactionValidationError::INPUT_INVALID_SIGNATURES_COUNT,
-                        "Transaction has an invalid number of signatures"
+                        describeRingMismatch(
+                            *m_blockchainCache,
+                            in.amount,
+                            m_blockHeight,
+                            globalIndexes,
+                            outputKeys.size(),
+                            m_transaction.signatures[inputIndex].size()
+                        )
                     );
 
                     return false;
